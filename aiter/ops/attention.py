@@ -850,7 +850,7 @@ def mla_decode_v4_asm(
     kv_page_indices: torch.Tensor,
     # [num_seqs+1]
     split_indptr: torch.Tensor,
-    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
+    # [num_heads] FP32 -- attention sink logit. Loaded by the kernel via
     # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
     # tensor; there is no nullable-sink convention on the C ABI. Pass
     # torch.full((num_heads,), float("-inf")) for "no sink" math.
@@ -1511,7 +1511,7 @@ def mla_reduce_v1(
         max_seqlen_q: max query length (tokens) per decode step.
         num_kv_splits: sizing hint for the reducer's per-split LDS scratch
             (``max_splits = max(device_cu_count, num_kv_splits)``).
-            **``0`` means auto** — size to the device CU count. Pass a value
+            **``0`` means auto** -- size to the device CU count. Pass a value
             larger than the CU count only to force a bigger split budget;
             values <= CU count (incl. 0) are clamped up to it.
         final_output: [bs, h, dv]. Combined, normalized output (written
@@ -1832,3 +1832,26 @@ def hk_mla_v40_decode_fwd(
         raise NotImplementedError(
             f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
         )
+
+
+@compile_ops("module_opus_mla")
+def mla_decode_fwd_opus_stage1(
+    q: torch.Tensor,  # [B, H, 576]           fp8 (merged nope+rope)
+    kv: torch.Tensor,  # [total_tokens, 576]   fp8 (merged nope+rope)
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    page_size: int,
+    nhead_kv: int,
+    softmax_scale: float,
+    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
+    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
+    out: torch.Tensor,  # final [B, H, 512] bf16
+    final_lse: torch.Tensor,
+    q_scale: torch.Tensor,  # float[1] per-tensor descale
+    kv_scale: torch.Tensor,  # float[1] per-tensor descale
+) -> None: ...
