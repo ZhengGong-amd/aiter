@@ -1,6 +1,6 @@
 name: FFM Aiter UT
 
-run-name: FFM aiter UT on ${{ inputs.runner || 'aiter-1gpu-runner' }}
+run-name: FFM aiter UT on ${{ inputs.runner || 'linux-aiter-oci-mi300x-1' }}
 
 on:
   pull_request:
@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: Self-hosted MI350 runner label to use for the FFM UT.
+        description: Self-hosted MI300X runner label to use for the FFM UT.
         required: true
-        default: aiter-1gpu-runner
+        default: linux-aiter-oci-mi300x-1
         type: string
       docker_image:
         description: FFM image to pull and test.
@@ -32,7 +32,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'aiter-1gpu-runner' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'linux-aiter-oci-mi300x-1' }}
   cancel-in-progress: true
 
 env:
@@ -40,6 +40,8 @@ env:
   FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
   FFM_TEST: op_tests/triton_tests
   FFM_SHARD_COUNT: 5
+  FFM_CASES_PER_TEST: 1
+  FFM_TRITON_COMMIT: 6cf030fe7bffce12a5712e20fb507a51d5123f10
 
 jobs:
   check-signal:
@@ -55,10 +57,10 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   ffm-aiter-ut:
-    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }}) / Shard ${{ matrix.shard }}
+    name: FFM Aiter UT (${{ inputs.runner || 'linux-aiter-oci-mi300x-1' }}) / Shard ${{ matrix.shard }}
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     needs: [check-signal]
-    runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
+    runs-on: ${{ inputs.runner || 'linux-aiter-oci-mi300x-1' }}
     timeout-minutes: 420
     strategy:
       fail-fast: false
@@ -144,6 +146,8 @@ jobs:
             -e FFM_TEST="${FFM_TEST}" \
             -e FFM_SHARD_INDEX="${{ matrix.shard }}" \
             -e FFM_SHARD_COUNT="${FFM_SHARD_COUNT}" \
+            -e FFM_CASES_PER_TEST="${FFM_CASES_PER_TEST}" \
+            -e FFM_TRITON_COMMIT="${FFM_TRITON_COMMIT}" \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${FFM_IMAGE}" \
@@ -159,6 +163,7 @@ jobs:
               echo "FFM_TEST=${FFM_TEST}"
               echo "FFM_SHARD_INDEX=${FFM_SHARD_INDEX}"
               echo "FFM_SHARD_COUNT=${FFM_SHARD_COUNT}"
+              echo "FFM_CASES_PER_TEST=${FFM_CASES_PER_TEST}"
               echo "PATH=${PATH}"
               echo "PYTHONPATH=${PYTHONPATH:-}"
 
@@ -169,6 +174,27 @@ jobs:
               echo "ENABLE_CK=${ENABLE_CK}"
               echo "AITER_TRITON_ONLY=${AITER_TRITON_ONLY}"
               echo "AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}"
+
+              echo "==== Build FFM Triton checkout ===="
+              TRITON_SOURCE_DIR=/root/triton
+              if ! git -C "${TRITON_SOURCE_DIR}" cat-file -e "${FFM_TRITON_COMMIT}^{commit}"; then
+                echo "::error::FFM image does not contain Triton commit ${FFM_TRITON_COMMIT}"
+                exit 1
+              fi
+              mapfile -t FFM_LLVM_DIRS < <(
+                find /root/.triton/llvm -mindepth 1 -maxdepth 1 -type d \
+                  -name 'llvm-*-ubuntu-x64-*' -print
+              )
+              if [ "${#FFM_LLVM_DIRS[@]}" -ne 1 ]; then
+                echo "::error::Expected one cached FFM LLVM toolchain, found ${#FFM_LLVM_DIRS[@]}"
+                printf "%s\n" "${FFM_LLVM_DIRS[@]}"
+                exit 1
+              fi
+              export LLVM_SYSPATH="${FFM_LLVM_DIRS[0]}"
+              git -C "${TRITON_SOURCE_DIR}" checkout --detach "${FFM_TRITON_COMMIT}"
+              MAX_JOBS=32 python3 -m pip install \
+                --break-system-packages --no-build-isolation -e "${TRITON_SOURCE_DIR}"
+              python3 -c 'import inspect; import triton; from triton.experimental.gluon.language.amd.gfx1250 import tdm; update_params = inspect.signature(tdm.update_tensor_descriptor).parameters; gather_params = inspect.signature(tdm.async_gather).parameters; assert "clamp_bounds" in update_params; assert list(gather_params)[:3] == ["desc", "src_row_indices", "dst"]; print(f"FFM Triton: {triton.__version__} ({triton.__file__})")'
 
               echo "==== Python packages before reinstall ===="
               python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
@@ -194,7 +220,30 @@ jobs:
               tr " " "\n" < "triton_shard_${FFM_SHARD_INDEX}.list" \
                 | sed "/^$/d" \
                 | grep -Fxv -f ffm_node_sharded_files.list \
-                > ffm_shard_items.list || true
+                > ffm_whole_files.list || true
+
+              : > ffm_shard_items.list
+              while IFS= read -r file; do
+                if [ ! -f "${file}" ]; then
+                  echo "FFM test file not present in reduced suite, skipping: ${file}"
+                  continue
+                fi
+                echo "Collecting representative cases from: ${file}"
+                if ! python3 -m pytest --collect-only -q "${file}" > ffm_collect_one_file.txt 2>&1; then
+                  cat ffm_collect_one_file.txt
+                  echo "::error::Failed to collect ${file}"
+                  exit 1
+                fi
+                awk \
+                  -v prefix="${file}::" \
+                  -v cases="${FFM_CASES_PER_TEST}" \
+                  'index($0, prefix) == 1 {
+                    test = $0
+                    sub(/\[.*/, "", test)
+                    if (++selected[test] <= cases) print
+                  }' \
+                  ffm_collect_one_file.txt >> ffm_shard_items.list
+              done < ffm_whole_files.list
 
               while IFS= read -r file; do
                 if [ ! -f "${file}" ]; then
@@ -211,7 +260,13 @@ jobs:
                   -v prefix="${file}::" \
                   -v shard="${FFM_SHARD_INDEX}" \
                   -v shards="${FFM_SHARD_COUNT}" \
-                  'index($0, prefix) == 1 { n++; if (((n - 1) % shards) == shard) print }' \
+                  -v cases="${FFM_CASES_PER_TEST}" \
+                  'index($0, prefix) == 1 {
+                    test = $0
+                    sub(/\[.*/, "", test)
+                    if (!(test in owner)) owner[test] = (test_count++ % shards)
+                    if (owner[test] == shard && ++selected[test] <= cases) print
+                  }' \
                   ffm_collect_one_file.txt >> ffm_shard_items.list
               done < ffm_node_sharded_files.list
 
