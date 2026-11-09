@@ -40,8 +40,12 @@ def _stage_backend(fn):
 
 def _dispatch(
     *,
+    token=TOKEN,
     model_dim=MODEL_DIM,
     inter_dim=INTER_DIM,
+    expert=E,
+    topk=TOPK,
+    activation=ActivationType.Swiglu,
     gate_mode=GateMode.SEPARATED,
     q_dtype_a=dtypes.bf16,
     both_weights_shuffled=True,
@@ -49,17 +53,17 @@ def _dispatch(
 ):
     get_2stage_cfgs.cache_clear()
     return get_2stage_cfgs(
-        TOKEN,
+        token,
         model_dim,
         inter_dim,
-        E,
-        TOPK,
+        expert,
+        topk,
         dtype,
         q_dtype_a,
         dtypes.fp4x2,
         QuantType.per_1x32,
         True,
-        ActivationType.Swiglu,
+        activation,
         False,
         0,
         0,
@@ -247,6 +251,50 @@ def test_cktile_stage2_allows_aligned_mxfp4_shape(monkeypatch):
         32,
     )
     assert called == [True]
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    ("token", "model_dim", "expert", "topk", "activation", "want"),
+    [
+        (1, MODEL_DIM, E, TOPK, ActivationType.Swiglu, 16),
+        (64, MODEL_DIM, E, TOPK, ActivationType.Swiglu, 16),
+        (65, MODEL_DIM, E, TOPK, ActivationType.Swiglu, 32),
+        (2050, MODEL_DIM, E, TOPK, ActivationType.Swiglu, 64),
+        (256, MODEL_DIM, 128, 4, ActivationType.Swiglu, 16),
+        (257, MODEL_DIM, 128, 4, ActivationType.Swiglu, 32),
+        (77, 7168, 896, 8, ActivationType.Situv2, 16),
+        (1023, 7168, 896, 8, ActivationType.Situv2, 32),
+    ],
+)
+def test_a16w4_fallback_tile_m_follows_rows_per_expert(
+    token, model_dim, expert, topk, activation, want
+):
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    meta = _dispatch(
+        token=token,
+        model_dim=model_dim,
+        expert=expert,
+        topk=topk,
+        activation=activation,
+    )
+    kn1 = meta.stage1.keywords["kernelName"]
+    kn2 = meta.stage2.keywords["kernelName"]
+    assert meta.block_m == want
+    assert kn1.startswith(f"flydsl_moe1_abf16_wfp4_bf16_t{want}x")
+    assert kn2.startswith(f"flydsl_moe2_abf16_wfp4_bf16_t{want}x")
+    assert get_flydsl_kernel_params(kn1)["tile_m"] == want
+    assert get_flydsl_kernel_params(kn2)["tile_m"] == want
+
+
+@_SKIP
+@pytest.mark.parametrize("token", [1, 37, 64])
+def test_a4w4_fallback_keeps_32_row_tile_when_sparse(token):
+    meta = _dispatch(token=token, q_dtype_a=dtypes.fp4x2)
+    kn1 = meta.stage1.keywords["kernelName"]
+    assert meta.block_m == 32
+    assert kn1.startswith("flydsl_moe1_afp4_wfp4_bf16_t32x")
 
 
 def _undo_shuffle_scale(scale):

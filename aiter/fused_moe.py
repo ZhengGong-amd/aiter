@@ -5258,6 +5258,9 @@ def get_2stage_cfgs(
             _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
         else:
             _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+        # a4w4 has no 16-row stage-1 kernel.
+        if _tile_m == 32 and _a_type == "bf16" and token * topk <= 8 * expert:
+            _tile_m = 16
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
