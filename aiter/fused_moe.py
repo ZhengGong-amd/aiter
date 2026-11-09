@@ -2490,6 +2490,10 @@ def fused_moe_1stage(
     return moe_buf
 
 
+# moe_sorting pads every touched expert to a full block_m.
+_BLOCK_M_ROWS_PER_EXPERT = ((21, 32), (60, 64))
+
+
 @functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
     cu_num = get_cu_num()
@@ -2504,7 +2508,13 @@ def get_block_size_M(token, topk, expert, inter_dim):
         rnd = (tg_num + cu_num - 1) // cu_num
         empty = cu_num - tg_num % cu_num
         tmp.append((rnd, empty, el))
-    return min(tmp, key=lambda x: x[:2])[-1]
+    block_m = min(tmp, key=lambda x: x[:2])[-1]
+    if get_gfx_runtime() == "gfx950":
+        rows_per_expert = token * topk / expert
+        for rows, el in _BLOCK_M_ROWS_PER_EXPERT:
+            if rows_per_expert < rows:
+                return min(block_m, el)
+    return block_m
 
 
 @functools.lru_cache(maxsize=2048)
