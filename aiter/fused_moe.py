@@ -929,17 +929,19 @@ def _stage2_honors_runtime_reduce_override(stage2: Callable) -> bool:
     )
 
 
+def _flydsl_kernel_uses_route_reduce(kernel_name: str) -> bool:
+    parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
+    return parsed is not None and parsed.get("mode", "atomic") == "reduce"
+
+
 def stage2_uses_route_reduce(stage2: Callable) -> bool:
     """Return True when stage2 writes per-slot route output then reduces it."""
     func = getattr(stage2, "func", stage2)
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
     if _is_flydsl_stage2(func):
-        parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
-        if parsed is None:
-            return False
         # The a16w-mix launcher honors explicit atomic/reduce table modes for
         # both MXFP4 and INT4; sorting must allocate the matching output layout.
-        return parsed.get("mode", "atomic") == "reduce"
+        return _flydsl_kernel_uses_route_reduce(kernel_name)
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
     if func is _flydsl_v2_stage2_wrapper:
@@ -2630,6 +2632,18 @@ def get_padded_M(M):
     return _PADDED_M_TIERS[0]
 
 
+def get_fallback_padded_Ms(padded_M):
+    """Smaller buckets whose tuned rows serve ``padded_M`` when it has none.
+
+    Nearest first, down to ``_PADDED_M_TIERS[0] // 2``.
+    """
+    if padded_M < _PADDED_M_TIERS[0]:
+        return []
+    return [t for t in reversed(_PADDED_M_TIERS) if t < padded_M] + [
+        _PADDED_M_TIERS[0] // 2
+    ]
+
+
 @dataclass
 class MOEMetadata:
     stage1: Callable | None
@@ -4279,9 +4293,8 @@ def get_2stage_cfgs(
         if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
         # Tier fallback: if current tier not found, try smaller tiers in descending order
-        if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
-            tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
-            for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
+        if result is None and config_file is None:
+            for fallback_tier in get_fallback_padded_Ms(token):
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
                 keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
                 keys_fb_disabled = (
@@ -4290,6 +4303,11 @@ def get_2stage_cfgs(
                 result = primary.get(keys_fb, None)
                 if result is None:
                     result = fallback.get(keys_fb_disabled, None)
+                # Route-reduce output grows with M and is capped at 32-bit addressing.
+                if result is not None and _flydsl_kernel_uses_route_reduce(
+                    str(result.get("kernelName2", "") or "").strip()
+                ):
+                    result = None
                 if result is not None:
                     break
         return result
