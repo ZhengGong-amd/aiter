@@ -4031,6 +4031,110 @@ def _can_reroute_bf16_to_a16wmix(
     return _swiglu_limit_is_active(swiglu_limit)
 
 
+_FLYDSL_TILE_RE = re.compile(r"_t(\d+)x(\d+)x(\d+)")
+_FLYDSL_XCD_RE = re.compile(r"_xcd\d+")
+_FLYDSL_SHARD_REUSE_MAX_TOKEN = 2048
+_flydsl_shard_index_cache = {}
+
+
+def _is_flydsl_2stage_row(row):
+    kn1 = str(row.get("kernelName1", "") or "")
+    kn2 = str(row.get("kernelName2", "") or "")
+    if not (kn1.startswith("flydsl_moe1_") and kn2.startswith("flydsl_moe2_")):
+        return False
+    # pandas reads a column with empty cells as float.
+    return str(row.get("run_1stage", 0)).strip() not in ("1", "1.0", "True", "true")
+
+
+def _flydsl_shard_index(tune_file, primary):
+    """Map the lookup key without inter_dim to [(inter_dim, row), ...]."""
+    cached = _flydsl_shard_index_cache.get(tune_file)
+    if cached is not None and cached[0] is primary:
+        return cached[1]
+    index = {}
+    for key, row in primary.items():
+        if _is_flydsl_2stage_row(row):
+            index.setdefault(key[:4] + key[5:], []).append((int(key[4]), row))
+    _flydsl_shard_index_cache[tune_file] = (primary, index)
+    return index
+
+
+def _flydsl_kernel_name_is_known(name):
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    return (
+        get_flydsl_kernel_params(name) is not None
+        or parse_flydsl_v2_gemm2_kernel(name) is not None
+    )
+
+
+def _flydsl_fit_tile(tuned_tile, axis, allowed):
+    """Largest allowed tile, no wider than the tuned one, that divides axis."""
+    fits = [t for t in allowed if t <= tuned_tile and axis % t == 0]
+    return max(fits) if fits else None
+
+
+def _flydsl_shard_cfg_fits(untuned, cfg):
+    """True when the untuned selection is FlyDSL 2-stage in cfg's gate/up layout."""
+    kn1, kn2 = (
+        str(kw.get("kernelName") or kw.get("kernelName2") or "")
+        for kw in (
+            getattr(s, "keywords", None) or {} for s in (untuned.stage1, untuned.stage2)
+        )
+    )
+    return (
+        not untuned.run_1stage
+        and kn1.startswith("flydsl_moe1_")
+        and kn2.startswith("flydsl_moe2_")
+        and ("_gui" in kn1) == ("_gui" in cfg["kernelName1"])
+    )
+
+
+def _flydsl_other_shard_cfg(tune_file, cfgs, lookup_keys, inter_dim):
+    """Tuned row of another inter_dim shard rebuilt for this one, or None."""
+    if not cfgs:
+        return None
+    try:
+        candidates = _flydsl_shard_index(tune_file, cfgs[0]).get(
+            lookup_keys[:4] + lookup_keys[5:], []
+        )
+        for src_inter_dim, row in sorted(
+            candidates,
+            key=lambda c: (max(c[0], inter_dim) / min(c[0], inter_dim), c[0]),
+        ):
+            names = []
+            for column, (n_axis, k_axis) in (
+                ("kernelName1", (inter_dim, None)),
+                ("kernelName2", (None, inter_dim)),
+            ):
+                name = _FLYDSL_XCD_RE.sub("", str(row[column]).strip())
+                tiles = _FLYDSL_TILE_RE.search(name)
+                if tiles is None:
+                    break
+                tile_m, tile_n, tile_k = (int(v) for v in tiles.groups())
+                if n_axis is not None:
+                    tile_n = _flydsl_fit_tile(tile_n, n_axis, (32, 64, 128, 256))
+                if k_axis is not None:
+                    tile_k = _flydsl_fit_tile(tile_k, k_axis, (128, 256))
+                if tile_n is None or tile_k is None:
+                    break
+                name = _FLYDSL_TILE_RE.sub(f"_t{tile_m}x{tile_n}x{tile_k}", name, 1)
+                if not _flydsl_kernel_name_is_known(name):
+                    break
+                names.append(name)
+            if len(names) != 2:
+                continue
+            logger.info(
+                f"[fused_moe] using the tuned FlyDSL config of inter_dim="
+                f"{src_inter_dim} for {lookup_keys}: kernelName1={names[0]!r}, "
+                f"kernelName2={names[1]!r}"
+            )
+            return {**row, "kernelName1": names[0], "kernelName2": names[1]}
+    except (ImportError, KeyError, TypeError, ValueError) as error:
+        logger.warning(f"[fused_moe] tuned config of another shard skipped: {error}")
+    return None
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -4066,7 +4170,9 @@ def get_2stage_cfgs(
     has_num_local_tokens=False,
     _exclude_mxmoe=False,
     _has_input_activation_scales=False,
+    _skip_shard_reuse=False,
 ):
+    call_args = dict(locals())
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
     flydsl_can_take_over = _can_reroute_mxfp4_to_flydsl(
@@ -4309,6 +4415,23 @@ def get_2stage_cfgs(
         cfg = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+
+    if (
+        cfg is None
+        and config_file is None
+        and token <= _FLYDSL_SHARD_REUSE_MAX_TOKEN
+        and not _skip_shard_reuse
+    ):
+        cfg = _flydsl_other_shard_cfg(
+            tune_file,
+            active_cfg_2stages,
+            keys[:7] + (str(activation),) + keys[8:],
+            inter_dim,
+        )
+        if cfg is not None and not _flydsl_shard_cfg_fits(
+            get_2stage_cfgs(**{**call_args, "_skip_shard_reuse": True}), cfg
+        ):
+            cfg = None
 
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()
